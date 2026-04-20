@@ -1,0 +1,34 @@
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE / editor
+.idea/
+.vscode/
+
+# Frontend dependencies and build outputs
+frontend/node_modules/
+frontend/dist/
+
+# Backend runtime outputs
+backend/logs/
+backend/generated_audio/
+
+# Local checkpoints and large artifacts
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.npy
+*.wav
+*.mp3
+
+# OS / misc
+*.pid
+
+# Local-only experiments
+song_generate_test.py

@@ -1,0 +1,67 @@
+{
+  "genre_style": {
+    "label": "流派/风格 (Genre/Style)",
+    "tags": [
+      "Cinematic", "Electronic", "Mandopop", "Lo-fi", "EDM", "Soundtrack",
+      "Hip-hop", "Ballad", "Ambient", "J-Pop", "R&B", "Trap", "Dance-Pop",
+      "Orchestral", "Lo-fi Hip-hop", "Classical", "Pop Ballad", "Chiptune",
+      "Pop", "Indie Pop", "Emotional Ballad", "Alternative Rock", "J-Rock",
+      "Progressive House", "Indie Rock", "Cinematic Ballad", "Synth-pop",
+      "Dream Pop", "Mandarin Rap", "Eurodance", "Club Banger", "Mandarin Pop",
+      "New Age", "Anime", "Synth-Pop", "Trance", "Cantopop", "Indie Folk",
+      "Film Score", "Electronic Pop", "Pop-Rock", "Game Soundtrack",
+      "Video Game Music", "Electro House", "Future Bass", "Synthwave",
+      "Mandarin Rock", "Easy Listening", "Dance", "Chinese Pop", "Chillhop",
+      "Alternative Indie", "Downtempo", "Chinese Traditional", "Downtempo DJ",
+      "Lo-fi Hip-Hop", "Urban", "C-Pop", "Cinematic Ambient",
+      "Contemporary Classical", "Chillwave", "Jazz", "Uzbek Pop", "Modern Pop",
+      "Cinematic Orchestral", "Dance Pop", "Melodic Rap", "World Music",
+      "Bedroom Pop"
+    ]
+  },
+  "vocal_instrument": {
+    "label": "人声/乐器 (Vocals/Instruments)",
+    "tags": [
+      "Male Vocals", "Female Vocals", "Instrumental", "Piano", "Synth Pads",
+      "Synth Pad", "Electric Guitar", "Synth Bass", "Acoustic Guitar",
+      "Sub-bass", "Arpeggiated Synths", "No Vocals", "Strings",
+      "Synth Arpeggios", "808 Bass", "Solo Piano", "Distorted Guitars",
+      "Synths", "Drum Machine", "Distorted Guitar", "Electronic Drums",
+      "Synth Arpeggio", "Atmospheric Pads", "Synth-driven", "Arpeggios",
+      "Male and Female Vocals", "Arpeggiated Synth", "Call-and-Response",
+      "Vocal Samples", "Spoken Word", "Electric Piano", "Male Rap",
+      "Processed Vocals", "Guzheng", "Synth", "Atmospheric Synths",
+      "Synth Lead", "Piano-driven", "Brass", "Bilingual", "Distorted Bass",
+      "Male Baritone", "Arpeggiated Guitar", "Percussion", "Cello",
+      "Chopped Vocals", "Emotional Vocals", "Harmonized Vocals", "Choir",
+      "Duet", "Vocal Chops", "Synthesized Strings", "Synth Strings",
+      "Driving Drums", "Fingerstyle", "Heavy Bass"
+    ]
+  },
+  "emotion_mood": {
+    "label": "情感/氛围 (Emotion/Mood)",
+    "tags": [
+      "Emotional", "Melancholic", "Atmospheric", "Nostalgic", "Introspective",
+      "Ethereal", "High Energy", "Uplifting", "Energetic", "Intimate",
+      "Euphoric", "Emotional Build", "Anthemic", "Aggressive", "Dramatic",
+      "Epic", "Reflective", "Romantic", "Dynamic Build", "Dreamy",
+      "Expressive", "Meditative", "Playful", "Cathartic", "Contemplative",
+      "Heroic", "Upbeat", "Confident", "Emotional Intensity", "Hypnotic",
+      "Heartbreak", "Anthemic Chorus", "Hopeful"
+    ]
+  },
+  "production_other": {
+    "label": "节奏/制作/其他 (Rhythm/Production/Other)",
+    "tags": [
+      "Slow Tempo", "Fast Tempo", "Reverb", "Wide Stereo", "Modern Production",
+      "Delay", "Mid-tempo", "Four-on-the-floor", "Minimalist",
+      "Studio Quality", "Rubato", "High-Fidelity", "High Fidelity",
+      "Vinyl Crackle", "Four-on-the-Floor", "Studio Production", "Danceable",
+      "Minor Key", "Moderate Tempo", "Sidechain Compression", "Studio Recording",
+      "Analog Warmth", "Lush Reverb", "Reverb-heavy", "Driving Beat",
+      "128 BPM", "120 BPM", "Analog Hiss", "Dancefloor", "Tape Hiss",
+      "1980s", "Syncopated Rhythm", "Expressive Rubato", "Retro",
+      "1990s", "Dynamic", "Club Energy", "Polished Production", "Heavy Reverb"
+    ]
+  }
+}

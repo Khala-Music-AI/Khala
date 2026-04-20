@@ -1,0 +1,19 @@
+# model config
+encoder:
+  input_channel: 2
+  n_filters: 128
+  strides: [4, 8, 8, 8]
+  d_latent: 128
+
+decoder:
+  d_latent: 128
+  n_filters: 192
+  rates: [8, 8, 8, 4]
+  out_channel: 2
+
+quantizer:
+  dim: ${encoder.d_latent}
+  codebook_size: 1024
+  num_quantizers: 64
+  decay: 0.99
+  q_dropout: False
