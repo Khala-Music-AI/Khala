@@ -46,9 +46,9 @@ Khala 的核心特点包括：
 
 ### ✅ 已更新
 
+- `[2026-05-11]` 已支持默认单卡安全启动，并兼容通过同一后端脚本覆盖多卡与不同运行模式的部署推理配置。
 - `[2026-05-05]` arXiv 论文已上线：[Khala: Scaling Acoustic Token Language Models Toward High-Fidelity Music Generation](https://arxiv.org/abs/2605.01790)
 - `[2026-05-01]` 代码、环境配置文档与 Dockerfile 已整理完成。
-- `[2026-05-11]` 已支持默认单卡安全启动，并兼容通过同一后端脚本覆盖多卡与不同运行模式的部署推理配置。
 
 ### ⏳ TODOs
 

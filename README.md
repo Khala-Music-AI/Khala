@@ -46,9 +46,9 @@ The core characteristics of Khala include:
 
 ### ✅ Updated
 
+- `[2026-05-11]` Backend inference launch now supports single-GPU safe startup by default, plus multi-GPU and runtime-mode overrides for deployment compatibility.
 - `[2026-05-05]` The arXiv paper is now available: [Khala: Scaling Acoustic Token Language Models Toward High-Fidelity Music Generation](https://arxiv.org/abs/2605.01790)
 - `[2026-05-01]` The codebase, environment documentation, and Dockerfile have been cleaned up for release.
-- `[2026-05-11]` Backend inference launch now supports single-GPU safe startup by default, plus multi-GPU and runtime-mode overrides for deployment compatibility.
 
 ### ⏳ TODOs
 
