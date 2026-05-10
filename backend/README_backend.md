@@ -37,16 +37,17 @@ This is the entry point for local or containerized deployment.
 
 It is responsible for:
 
-- defining user-facing launch configuration
+- providing a default single-GPU safe launch mode
+- accepting advanced CLI overrides for GPU selection and runtime mode
 - starting one worker process per GPU in `GPU_IDS`
 - waiting until workers become healthy
 - starting the API dispatcher
 - tailing logs in the foreground
 
-Important config lives at the top of the file:
+Important launch controls include:
 
-- `GPU_IDS`: physical GPUs used by workers
-- `NUM_WORKERS`: derived automatically from `GPU_IDS`
+- `--gpus`: physical GPU ids used by workers
+- `--runtime-mode`: `one_shot` or `keep_loaded`
 - `API_PORT`
 - `WORKER_BASE_PORT`
 - `BASE_MASTER_PORT`
@@ -101,6 +102,20 @@ cd backend
 bash run_backend.sh
 ```
 
+Default behavior:
+
+- uses GPU `0`
+- starts one worker
+- runs in `one_shot` mode
+
+Common advanced examples:
+
+```bash
+bash run_backend.sh --gpus 0
+bash run_backend.sh --gpus 0,1
+bash run_backend.sh --gpus 0,1 --runtime-mode keep_loaded
+```
+
 Stop all backend processes:
 
 ```bash
@@ -141,21 +156,29 @@ Each request writes:
 
 ### Change how many GPUs are used
 
-Edit `GPU_IDS` in [run_backend.sh](./run_backend.sh):
+Pass `--gpus` to `run_backend.sh`:
 
 ```bash
-GPU_IDS=(0)
+bash run_backend.sh --gpus 0
+bash run_backend.sh --gpus 0,1
+bash run_backend.sh --gpus 6,7
 ```
 
-Examples:
+One worker is started per GPU id. The worker count is derived automatically from the number of ids you provide.
+
+### Change runtime mode
+
+Pass `--runtime-mode` to `run_backend.sh`:
 
 ```bash
-GPU_IDS=(0)
-GPU_IDS=(0 1)
-GPU_IDS=(2 3)
+bash run_backend.sh --runtime-mode one_shot
+bash run_backend.sh --runtime-mode keep_loaded
 ```
 
-`NUM_WORKERS` is derived automatically from the length of `GPU_IDS`.
+Guidance:
+
+- `one_shot`: safer default for single-GPU or lower-VRAM setups
+- `keep_loaded`: better for higher-memory GPUs and repeated inference
 
 ### Change ports
 
@@ -219,4 +242,3 @@ Check:
 - the worker log for `ffmpeg` errors
 - whether the files exist under `backend/generated_audio/`
 - whether the API successfully fetched `/download/{filename}` from the worker
-

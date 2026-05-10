@@ -8,12 +8,14 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import gc
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -41,6 +43,7 @@ MEGATRON_ROOT = os.path.join(PROJECT_ROOT, "models", "Megatron")
 DECODER_ROOT = os.path.join(PROJECT_ROOT, "models", "Decoder")
 TOKENIZER_PATH = os.path.join(PROJECT_ROOT, "models", "Tokenizer")
 OUTPUT_DIR = os.path.join(BACKEND_DIR, "generated_audio")
+LOG_DIR = os.path.join(BACKEND_DIR, "logs")
 
 
 def prepend_sys_path(path: str) -> None:
@@ -53,6 +56,7 @@ prepend_sys_path(MEGATRON_ROOT)
 prepend_sys_path(DECODER_ROOT)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
 
 # ============================================================
@@ -79,21 +83,22 @@ CODEC_FPS = 21.5
 BACKBONE_MAX_PROMPT_LEN = 4096
 SUPERRES_MAX_PROMPT_LEN = 2048
 TOKENS_PER_MINUTE = 2584
-
+DECODER_CHUNK_SIZE = 1920
+DECODER_CHUNK_OVERLAP = 480
 
 # ============================================================
 # Runtime configuration
 # ============================================================
 
 BACKBONE_MODELS = {
-    "default_backbone": {
+    "q01_354k_tag_desc_v0 (0217)": {
         "path": os.path.join(CHECKPOINTS_DIR, "backbone"),
         "vocab_size": 130304,
     }
 }
 
 SUPERRES_MODELS = {
-    "default_superres": {
+    "q01_ft5k_super_v2 (0215)": {
         "path": os.path.join(CHECKPOINTS_DIR, "superresolution"),
         "vocab_size": 193792,
     }
@@ -102,7 +107,6 @@ SUPERRES_MODELS = {
 DECODER_CONFIG_PATH = os.path.join(DECODER_ROOT, "dac_rvq_1024_64_golden.yaml")
 DECODER_CHECKPOINT_PATH = os.path.join(CHECKPOINTS_DIR, "dac_rvq_2490000.ckpt")
 
-DECODER_CHUNK_SIZE = 480
 
 GENRE_OPTIONS = [
     "Pop", "Rock", "R&B", "Hip-Hop", "Electronic", "Jazz", "Classical",
@@ -142,6 +146,7 @@ RESOURCES: dict = {
 
 STATE = WorkerRuntimeState()
 STATE_LOCK = threading.Lock()
+RUNTIME_MODE = "one_shot"
 
 
 # ============================================================
@@ -158,13 +163,14 @@ class GenerateRequest(BaseModel):
     lyrics: str = ""
     backbone_name: str = ""
     superres_name: str = ""
-    top_k_bb: int = 80
+    top_k_bb: int = 50
     top_k_sr: int = 10
     temperature: float = 1.0
     superres_text_mode: str = "same_as_backbone"
     raw_user_input: str = ""
     raw_mode: str = ""
     raw_prompt_mode: str = ""
+    seed_override: int = 0
 
 
 # ============================================================
@@ -187,6 +193,51 @@ def set_phase(phase: str, progress: int = 0, detail: str = "") -> None:
 
 def set_status(status: str) -> None:
     STATE.status = status
+
+
+def state_snapshot() -> dict:
+    return {
+        "status": STATE.status,
+        "phase": STATE.phase,
+        "gpu_id": STATE.gpu_id,
+        "seed": STATE.seed,
+        "progress": STATE.progress,
+        "progress_detail": STATE.progress_detail,
+        "runtime_mode": RUNTIME_MODE,
+        "backbone_loaded": RESOURCES["backbone_name"],
+        "superres_loaded": RESOURCES["superres_name"],
+        "decoder_loaded": RESOURCES["decoder"] is not None,
+    }
+
+
+def write_status_snapshot(path: str) -> None:
+    if not path:
+        return
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(state_snapshot(), file, ensure_ascii=False)
+
+
+def start_status_writer(path: str) -> tuple[threading.Event, threading.Thread] | tuple[None, None]:
+    if not path:
+        return None, None
+
+    stop_event = threading.Event()
+
+    def loop() -> None:
+        while not stop_event.is_set():
+            try:
+                write_status_snapshot(path)
+            except Exception:
+                pass
+            stop_event.wait(0.5)
+        try:
+            write_status_snapshot(path)
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=loop, name="status-writer", daemon=True)
+    thread.start()
+    return stop_event, thread
 
 
 def clear_cuda_memory() -> None:
@@ -254,6 +305,13 @@ def add_worker_args(parser):
 
     group = parser.add_argument_group(title="worker")
     group.add_argument("--worker-port", type=int, default=8001, help="FastAPI port")
+    group.add_argument(
+        "--runtime-mode",
+        type=str,
+        default="one_shot",
+        choices=["keep_loaded", "one_shot"],
+        help="Worker runtime mode: keep models loaded, or spawn one-shot subprocesses per request.",
+    )
     group.add_argument("--stream", action="store_true", default=False)
     group.add_argument(
         "--max-batch-size",
@@ -262,6 +320,12 @@ def add_worker_args(parser):
         dest="max_batch_size",
         help="Deprecated alias for --inference-max-requests",
     )
+    group.add_argument("--child-once", action="store_true", default=False, help=argparse.SUPPRESS)
+    group.add_argument("--child-stage", type=str, default="", help=argparse.SUPPRESS)
+    group.add_argument("--artifact-dir", type=str, default="", help=argparse.SUPPRESS)
+    group.add_argument("--request-json", type=str, default="", help=argparse.SUPPRESS)
+    group.add_argument("--result-json", type=str, default="", help=argparse.SUPPRESS)
+    group.add_argument("--status-json", type=str, default="", help=argparse.SUPPRESS)
     return parser
 
 
@@ -515,7 +579,7 @@ def tokenize_prompt_text(prompt_text: str) -> list[int]:
     )[0].tolist()
 
 
-def prepare_prompt_ids(
+def prepare_prompt_texts(
     genre: str,
     language: str,
     tags: str,
@@ -523,8 +587,8 @@ def prepare_prompt_ids(
     duration: int,
     lyrics: str,
     superres_text_mode: str,
-) -> tuple[list[int], list[int]]:
-    """Prepare backbone and superres prompt ids from a single user request."""
+) -> tuple[str, str]:
+    """Prepare backbone and superres prompt texts from a single user request."""
     if superres_text_mode == "same_as_backbone":
         backbone_language = language if language == "Instrumental" else ""
         backbone_prompt_text = compose_prompt_text(
@@ -535,8 +599,28 @@ def prepare_prompt_ids(
             tags=tags,
             description=description,
         )
-        backbone_prompt_ids = tokenize_prompt_text(backbone_prompt_text)
-        superres_prompt_ids = backbone_prompt_ids
+        superres_prompt_text = backbone_prompt_text
+    elif superres_text_mode == "same_as_backbone_no_description":
+        backbone_language = language if language == "Instrumental" else ""
+        backbone_prompt_text = compose_prompt_text(
+            lyrics=lyrics,
+            genre=genre,
+            language=backbone_language,
+            duration=duration,
+            tags=tags,
+            description=description,
+        )
+        superres_tags = tags
+        if description.strip():
+            superres_tags = ""
+        superres_prompt_text = compose_prompt_text(
+            lyrics=lyrics,
+            genre=genre,
+            language=backbone_language,
+            duration=duration,
+            tags=superres_tags,
+            description="",
+        )
     else:
         backbone_prompt_text = compose_prompt_text(
             lyrics=lyrics,
@@ -554,7 +638,33 @@ def prepare_prompt_ids(
             tags="",
             description="",
         )
-        backbone_prompt_ids = tokenize_prompt_text(backbone_prompt_text)
+
+    return backbone_prompt_text, superres_prompt_text
+
+
+def prepare_prompt_ids(
+    genre: str,
+    language: str,
+    tags: str,
+    description: str,
+    duration: int,
+    lyrics: str,
+    superres_text_mode: str,
+) -> tuple[list[int], list[int]]:
+    """Prepare backbone and superres prompt ids from a single user request."""
+    backbone_prompt_text, superres_prompt_text = prepare_prompt_texts(
+        genre=genre,
+        language=language,
+        tags=tags,
+        description=description,
+        duration=duration,
+        lyrics=lyrics,
+        superres_text_mode=superres_text_mode,
+    )
+    backbone_prompt_ids = tokenize_prompt_text(backbone_prompt_text)
+    if superres_prompt_text == backbone_prompt_text:
+        superres_prompt_ids = backbone_prompt_ids
+    else:
         superres_prompt_ids = tokenize_prompt_text(superres_prompt_text)
 
     backbone_prompt_ids = clamp_prompt_ids(
@@ -620,7 +730,7 @@ def generate_backbone(prompt_ids: list[int], top_k: int, temperature: float, dur
         top_k=int(top_k),
         num_tokens_to_generate=args.num_tokens_to_generate,
     )
-    estimated_tokens = TOKENS_PER_MINUTE * (int(duration) + 1)
+    estimated_tokens = round(TOKENS_PER_MINUTE * (float(duration) + 0.8))
 
     start_time = time.perf_counter()
     if getattr(args, "stream", False):
@@ -806,16 +916,62 @@ def decode_to_wav(audio_tokens: torch.Tensor, wav_path: str) -> str:
         raise RuntimeError("Decoder not loaded.")
 
     decoder_device = next(decoder.parameters()).device
-    chunks = []
-    for start in range(0, audio_tokens.size(2), DECODER_CHUNK_SIZE):
-        token_chunk = audio_tokens[..., start: start + DECODER_CHUNK_SIZE]
+    chunk_size = DECODER_CHUNK_SIZE
+    overlap_tokens = max(0, min(DECODER_CHUNK_OVERLAP, chunk_size - 1))
+    stride = chunk_size - overlap_tokens if overlap_tokens > 0 else chunk_size
+
+    waveform = None
+    prev_token_len = 0
+    prev_waveform_chunk_len = 0
+
+    for start in range(0, audio_tokens.size(2), stride):
+        token_chunk = audio_tokens[..., start: start + chunk_size]
         if token_chunk.device != decoder_device:
             token_chunk = token_chunk.to(decoder_device, non_blocking=True)
         waveform_chunk = decoder.decode(token_chunk).detach().cpu()
-        chunks.append(waveform_chunk)
+        current_token_len = token_chunk.size(2)
+        current_waveform_chunk_len = waveform_chunk.size(2)
+
+        if waveform is None or overlap_tokens == 0:
+            waveform = waveform_chunk
+            prev_token_len = current_token_len
+            prev_waveform_chunk_len = current_waveform_chunk_len
+            del token_chunk, waveform_chunk
+            continue
+
+        actual_overlap_tokens = min(overlap_tokens, prev_token_len, current_token_len)
+        prev_overlap_samples = round(
+            prev_waveform_chunk_len * actual_overlap_tokens / max(1, prev_token_len)
+        )
+        curr_overlap_samples = round(
+            current_waveform_chunk_len * actual_overlap_tokens / max(1, current_token_len)
+        )
+        overlap_samples = min(prev_overlap_samples, curr_overlap_samples)
+
+        if overlap_samples > 0:
+            fade_out = torch.linspace(1.0, 0.0, overlap_samples, dtype=waveform.dtype).view(
+                1, 1, -1
+            )
+            fade_in = 1.0 - fade_out
+            blended = (
+                waveform[:, :, -overlap_samples:] * fade_out
+                + waveform_chunk[:, :, :overlap_samples] * fade_in
+            )
+            waveform = torch.cat(
+                [
+                    waveform[:, :, :-overlap_samples],
+                    blended,
+                    waveform_chunk[:, :, overlap_samples:],
+                ],
+                dim=2,
+            )
+        else:
+            waveform = torch.cat([waveform, waveform_chunk], dim=2)
+
+        prev_token_len = current_token_len
+        prev_waveform_chunk_len = current_waveform_chunk_len
         del token_chunk, waveform_chunk
 
-    waveform = torch.cat(chunks, dim=2)
     waveform_np = waveform.squeeze(0).numpy().T
     sf.write(wav_path, waveform_np, DECODER_SAMPLE_RATE)
     return wav_path
@@ -829,7 +985,7 @@ def wav_to_mp3(wav_path: str, mp3_path: str) -> str:
         "-i",
         wav_path,
         "-b:a",
-        "128k",
+        "320k",
         "-ar",
         str(DECODER_SAMPLE_RATE),
         mp3_path,
@@ -916,11 +1072,13 @@ def write_outputs(
 def reset_request_state() -> None:
     set_status("idle")
     set_phase("idle", 0, "")
-    torch.cuda.empty_cache()
+    clear_cuda_memory()
 
 
 def release_request_models() -> None:
-    """Release per-request models while keeping tokenizer and backbone hot."""
+    """Release per-request GPU models in one-shot mode only."""
+    if RUNTIME_MODE == "keep_loaded":
+        return
     if RESOURCES["superres"] is not None:
         free_resource("superres")
         RESOURCES["superres_name"] = None
@@ -930,11 +1088,340 @@ def release_request_models() -> None:
         print("[Worker] Released decoder after request.")
 
 
+def release_superres_for_stage_transition() -> None:
+    """Release superres right after q0..q63 generation to free space for decoder."""
+    if RESOURCES["superres"] is not None:
+        free_resource("superres")
+        RESOURCES["superres_name"] = None
+        print("[Worker] Released superres before decoder.")
+
+
+def release_backbone_for_stage_transition() -> None:
+    """Release backbone right after q0/q1 generation when the process is one-shot."""
+    if RESOURCES["backbone_engine"] is not None:
+        free_resource("backbone_engine")
+    if RESOURCES["backbone"] is not None:
+        free_resource("backbone")
+        RESOURCES["backbone_name"] = None
+        print("[Worker] Released backbone before superres.")
+
+
+def filtered_child_args(argv: list[str]) -> list[str]:
+    """Forward Megatron/model args to a one-shot child while dropping service-only flags."""
+    skip_with_value = {
+        "--worker-port",
+        "--runtime-mode",
+        "--child-stage",
+        "--artifact-dir",
+        "--request-json",
+        "--result-json",
+        "--status-json",
+        "--seed",
+    }
+    skip_flags = {"--child-once"}
+
+    forwarded: list[str] = []
+    idx = 1
+    while idx < len(argv):
+        token = argv[idx]
+        if token in skip_flags:
+            idx += 1
+            continue
+        if token in skip_with_value:
+            idx += 2
+            continue
+        forwarded.append(token)
+        idx += 1
+    return forwarded
+
+
+def sync_state_from_file(path: str) -> None:
+    """Mirror child progress back into the parent worker state."""
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except Exception:
+        return
+
+    STATE.status = data.get("status", STATE.status)
+    STATE.phase = data.get("phase", STATE.phase)
+    STATE.progress = data.get("progress", STATE.progress)
+    STATE.progress_detail = data.get("progress_detail", STATE.progress_detail)
+    STATE.seed = data.get("seed", STATE.seed)
+    STATE.gpu_id = data.get("gpu_id", STATE.gpu_id)
+
+
+def build_one_shot_command(
+    stage: str,
+    artifact_dir: str,
+    request_path: str,
+    result_path: str,
+    status_path: str,
+    seed_override: int,
+) -> list[str]:
+    """Construct the subprocess command used by one-shot workers."""
+    return [
+        sys.executable,
+        os.path.abspath(__file__),
+        *filtered_child_args(sys.argv),
+        "--seed",
+        str(seed_override),
+        "--runtime-mode",
+        "one_shot",
+        "--child-once",
+        "--child-stage",
+        stage,
+        "--artifact-dir",
+        artifact_dir,
+        "--request-json",
+        request_path,
+        "--result-json",
+        result_path,
+        "--status-json",
+        status_path,
+    ]
+
+
+def one_shot_stage_paths(artifact_dir: str) -> dict[str, str]:
+    return {
+        "backbone_result": os.path.join(artifact_dir, "backbone_result.json"),
+        "superres_result": os.path.join(artifact_dir, "superres_result.json"),
+        "superres_tokens_npy": os.path.join(artifact_dir, "superres_tokens.npy"),
+        "decoder_result": os.path.join(artifact_dir, "decoder_result.json"),
+    }
+
+
+def run_backbone_stage(request: GenerateRequest) -> dict:
+    """Run only the backbone stage and persist q0/q1 tokens for the next child."""
+    set_status("busy")
+    set_phase("loading_backbone", 0, "")
+    load_text_tokenizer()
+
+    backbone_name = default_backbone_name(request.backbone_name)
+    superres_name = default_superres_name(request.superres_name)
+    backbone_prompt_text, superres_prompt_text = prepare_prompt_texts(
+        genre=request.genre,
+        language=request.language,
+        tags=request.tags,
+        description=request.description,
+        duration=int(request.duration),
+        lyrics=request.lyrics,
+        superres_text_mode=request.superres_text_mode,
+    )
+    backbone_prompt_ids, superres_prompt_ids = prepare_prompt_ids(
+        genre=request.genre,
+        language=request.language,
+        tags=request.tags,
+        description=request.description,
+        duration=int(request.duration),
+        lyrics=request.lyrics,
+        superres_text_mode=request.superres_text_mode,
+    )
+
+    load_backbone(backbone_name)
+    set_phase("backbone", 0, "")
+    _, backbone_tokens = generate_backbone(
+        prompt_ids=backbone_prompt_ids,
+        top_k=int(request.top_k_bb),
+        temperature=float(request.temperature),
+        duration=int(request.duration),
+    )
+    return {
+        "status": "ok",
+        "backbone_name": backbone_name,
+        "superres_name": superres_name,
+        "backbone_tokens": backbone_tokens,
+        "backbone_tokens_count": len(backbone_tokens),
+        "superres_prompt_ids": superres_prompt_ids,
+    }
+
+
+def run_superres_stage(request: GenerateRequest, artifact_dir: str) -> dict:
+    """Run only the superres stage and persist q0..q63 tokens for decoder."""
+    paths = one_shot_stage_paths(artifact_dir)
+    with open(paths["backbone_result"], "r", encoding="utf-8") as file:
+        backbone_result = json.load(file)
+
+    set_status("busy")
+    set_phase("loading_superres", 0, "")
+    superres_name = backbone_result["superres_name"]
+    superres_prompt_ids = backbone_result["superres_prompt_ids"]
+    backbone_tokens = backbone_result["backbone_tokens"]
+
+    load_superres(superres_name)
+    set_phase("superres", 0, "")
+    audio_tokens = generate_superres(
+        superres_prompt_ids=superres_prompt_ids,
+        backbone_tokens=backbone_tokens,
+        top_k=int(request.top_k_sr),
+    )
+    audio_tokens_cpu = audio_tokens.cpu()
+    del audio_tokens
+    clear_cuda_memory()
+
+    audio_tokens_np = audio_tokens_cpu.numpy()
+    np.save(paths["superres_tokens_npy"], audio_tokens_np)
+    return {
+        "status": "ok",
+        "superres_name": superres_name,
+        "audio_q0_63_npy": paths["superres_tokens_npy"],
+        "audio_q0_63_shape": list(audio_tokens_np.shape),
+        "audio_q0_63_dtype": str(audio_tokens_np.dtype),
+    }
+
+
+def run_decoder_stage(request: GenerateRequest, artifact_dir: str) -> dict:
+    """Run only the decoder stage from persisted q0..q63 tokens."""
+    paths = one_shot_stage_paths(artifact_dir)
+    with open(paths["backbone_result"], "r", encoding="utf-8") as file:
+        backbone_result = json.load(file)
+    with open(paths["superres_result"], "r", encoding="utf-8") as file:
+        superres_result = json.load(file)
+
+    set_status("busy")
+    set_phase("loading_decoder", 0, "")
+    load_decoder()
+    set_phase("decoding", 0, "decoding audio")
+
+    audio_tokens_np = np.load(superres_result["audio_q0_63_npy"])
+    audio_tokens = torch.from_numpy(audio_tokens_np)
+    return write_outputs(
+        request=request,
+        backbone_name=backbone_result["backbone_name"],
+        superres_name=backbone_result["superres_name"],
+        backbone_tokens_count=int(backbone_result["backbone_tokens_count"]),
+        audio_tokens=audio_tokens,
+    )
+
+
+def run_child_stage(
+    stage: str,
+    request_json: str,
+    result_json: str,
+    status_json: str,
+    artifact_dir: str,
+) -> int:
+    """Child-process entrypoint for one one-shot stage."""
+    stop_event, status_thread = start_status_writer(status_json)
+    try:
+        with open(request_json, "r", encoding="utf-8") as file:
+            request_payload = json.load(file)
+        request = GenerateRequest(**request_payload)
+
+        if stage == "backbone":
+            result = run_backbone_stage(request)
+        elif stage == "superres":
+            result = run_superres_stage(request, artifact_dir)
+        elif stage == "decoder":
+            result = run_decoder_stage(request, artifact_dir)
+        else:
+            raise ValueError(f"Unsupported child stage: {stage}")
+
+        with open(result_json, "w", encoding="utf-8") as file:
+            json.dump(result, file, ensure_ascii=False, indent=2)
+        return 0 if result.get("status") == "ok" else 1
+    except Exception:
+        error_text = traceback.format_exc()
+        with open(result_json, "w", encoding="utf-8") as file:
+            json.dump({"status": "error", "error": error_text}, file, ensure_ascii=False, indent=2)
+        return 1
+    finally:
+        if stop_event is not None:
+            stop_event.set()
+        if status_thread is not None:
+            status_thread.join(timeout=2.0)
+
+
+def run_generation_one_shot(request: GenerateRequest) -> dict:
+    """Execute one request in a short-lived child process for process-level VRAM cleanup."""
+    with STATE_LOCK:
+        set_status("busy")
+        set_phase("loading_backbone", 0, "")
+
+        with tempfile.TemporaryDirectory(prefix="khala_worker_", dir=BACKEND_DIR) as temp_dir:
+            request_path = os.path.join(temp_dir, "request.json")
+            paths = one_shot_stage_paths(temp_dir)
+
+            with open(request_path, "w", encoding="utf-8") as file:
+                json.dump(request.model_dump(), file, ensure_ascii=False, indent=2)
+
+            child_seed = int(request.seed_override) if int(request.seed_override) > 0 else int(STATE.seed)
+            stages = [
+                ("backbone", paths["backbone_result"]),
+                ("superres", paths["superres_result"]),
+                ("decoder", paths["decoder_result"]),
+            ]
+            loading_phase_by_stage = {
+                "backbone": "loading_backbone",
+                "superres": "loading_superres",
+                "decoder": "loading_decoder",
+            }
+
+            try:
+                for stage_name, result_path in stages:
+                    set_phase(loading_phase_by_stage[stage_name], 0, "")
+                    status_path = os.path.join(temp_dir, f"{stage_name}_status.json")
+                    log_path = os.path.join(temp_dir, f"{stage_name}.log")
+                    command = build_one_shot_command(
+                        stage_name,
+                        temp_dir,
+                        request_path,
+                        result_path,
+                        status_path,
+                        child_seed,
+                    )
+                    print(f"[Worker] Launching one-shot {stage_name} child: {' '.join(command)}")
+
+                    env = os.environ.copy()
+                    with open(log_path, "w", encoding="utf-8") as log_file:
+                        proc = subprocess.Popen(
+                            command,
+                            cwd=BACKEND_DIR,
+                            env=env,
+                            stdout=log_file,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                        )
+
+                        while proc.poll() is None:
+                            sync_state_from_file(status_path)
+                            time.sleep(0.5)
+
+                        sync_state_from_file(status_path)
+
+                    if os.path.isfile(result_path):
+                        with open(result_path, "r", encoding="utf-8") as file:
+                            result = json.load(file)
+                    else:
+                        with open(log_path, "r", encoding="utf-8") as file:
+                            log_text = file.read()[-4000:]
+                        return {
+                            "status": "error",
+                            "error": (
+                                f"one_shot {stage_name} child exited with code {proc.returncode} "
+                                f"without a result file.\n{log_text}"
+                            ),
+                        }
+
+                    if result.get("status") != "ok":
+                        return result
+
+                with open(paths["decoder_result"], "r", encoding="utf-8") as file:
+                    return json.load(file)
+            finally:
+                set_status("idle")
+                set_phase("idle", 0, "")
+                STATE.progress_detail = ""
+                STATE.progress = 0
+
+
 def run_generation(request: GenerateRequest) -> dict:
     """Main request path executed by the worker's /generate endpoint."""
     with STATE_LOCK:
         set_status("busy")
-        set_phase("backbone", 0, "")
+        set_phase("loading_backbone", 0, "")
         request_started_at = time.perf_counter()
 
         try:
@@ -949,7 +1436,15 @@ def run_generation(request: GenerateRequest) -> dict:
 
             backbone_name = default_backbone_name(request.backbone_name)
             superres_name = default_superres_name(request.superres_name)
-
+            backbone_prompt_text, superres_prompt_text = prepare_prompt_texts(
+                genre=request.genre,
+                language=request.language,
+                tags=request.tags,
+                description=request.description,
+                duration=int(request.duration),
+                lyrics=request.lyrics,
+                superres_text_mode=request.superres_text_mode,
+            )
             backbone_prompt_ids, superres_prompt_ids = prepare_prompt_ids(
                 genre=request.genre,
                 language=request.language,
@@ -961,29 +1456,39 @@ def run_generation(request: GenerateRequest) -> dict:
             )
 
             load_backbone(backbone_name)
+            set_phase("backbone", 0, "")
             _, backbone_tokens = generate_backbone(
                 prompt_ids=backbone_prompt_ids,
                 top_k=int(request.top_k_bb),
                 temperature=float(request.temperature),
                 duration=int(request.duration),
             )
+            if RUNTIME_MODE == "one_shot":
+                release_backbone_for_stage_transition()
 
-            set_phase("superres", 0, "")
+            set_phase("loading_superres", 0, "")
             load_superres(superres_name)
+            set_phase("superres", 0, "")
             audio_tokens = generate_superres(
                 superres_prompt_ids=superres_prompt_ids,
                 backbone_tokens=backbone_tokens,
                 top_k=int(request.top_k_sr),
             )
+            audio_tokens_cpu = audio_tokens.cpu()
+            del audio_tokens
+            clear_cuda_memory()
+            if RUNTIME_MODE == "one_shot":
+                release_superres_for_stage_transition()
 
-            set_phase("decoding", 0, "decoding audio")
+            set_phase("loading_decoder", 0, "")
             load_decoder()
+            set_phase("decoding", 0, "decoding audio")
             return write_outputs(
                 request=request,
                 backbone_name=backbone_name,
                 superres_name=superres_name,
                 backbone_tokens_count=len(backbone_tokens),
-                audio_tokens=audio_tokens.cpu(),
+                audio_tokens=audio_tokens_cpu,
             )
         except Exception:
             error_text = traceback.format_exc()
@@ -1003,17 +1508,7 @@ def run_generation(request: GenerateRequest) -> dict:
 
 @app.get("/health")
 def health():
-    return {
-        "status": STATE.status,
-        "phase": STATE.phase,
-        "gpu_id": STATE.gpu_id,
-        "seed": STATE.seed,
-        "progress": STATE.progress,
-        "progress_detail": STATE.progress_detail,
-        "backbone_loaded": RESOURCES["backbone_name"],
-        "superres_loaded": RESOURCES["superres_name"],
-        "decoder_loaded": RESOURCES["decoder"] is not None,
-    }
+    return state_snapshot()
 
 
 @app.get("/config")
@@ -1023,6 +1518,7 @@ def config():
         "superres_models": list(SUPERRES_MODELS.keys()),
         "genre_options": GENRE_OPTIONS,
         "language_options": LANGUAGE_OPTIONS,
+        "runtime_mode": RUNTIME_MODE,
     }
 
 
@@ -1030,6 +1526,8 @@ def config():
 def api_generate(request: GenerateRequest):
     if STATE.status == "busy":
         return {"status": "busy", "error": "Worker is currently busy."}
+    if RUNTIME_MODE == "one_shot":
+        return run_generation_one_shot(request)
     return run_generation(request)
 
 
@@ -1048,11 +1546,22 @@ def download(filename: str):
 
 
 def preload_runtime() -> None:
-    """Warm the long-lived runtime pieces during process startup."""
+    """Warm all long-lived runtime pieces during process startup."""
     load_text_tokenizer()
-    load_decoder()
     load_backbone(default_backbone_name(""))
     load_superres(default_superres_name(""))
+    load_decoder()
+
+
+def cli_value(argv: list[str], flag: str, default: str = "") -> str:
+    for index, arg in enumerate(argv):
+        if arg == flag and index + 1 < len(argv):
+            return argv[index + 1]
+    return default
+
+
+def cli_has_flag(argv: list[str], flag: str) -> bool:
+    return flag in argv
 
 
 def main() -> None:
@@ -1061,13 +1570,32 @@ def main() -> None:
     from megatron.training import get_args
     from megatron.training.initialize import initialize_megatron
 
-    worker_port = 8001
-    for index, arg in enumerate(_sys.argv):
-        if arg == "--worker-port" and index + 1 < len(_sys.argv):
-            worker_port = int(_sys.argv[index + 1])
-            break
+    global RUNTIME_MODE
+
+    worker_port = int(cli_value(_sys.argv, "--worker-port", "8001"))
+    runtime_mode = cli_value(_sys.argv, "--runtime-mode", "one_shot") or "one_shot"
+    child_stage = cli_value(_sys.argv, "--child-stage", "")
+    artifact_dir = cli_value(_sys.argv, "--artifact-dir", "")
+    request_json = cli_value(_sys.argv, "--request-json", "")
+    result_json = cli_value(_sys.argv, "--result-json", "")
+    status_json = cli_value(_sys.argv, "--status-json", "")
+    child_once = cli_has_flag(_sys.argv, "--child-once")
+    RUNTIME_MODE = runtime_mode
 
     STATE.gpu_id = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
+    STATE.seed = int(cli_value(_sys.argv, "--seed", "0") or 0)
+
+    if runtime_mode == "one_shot" and not child_once:
+        set_status("idle")
+        set_phase("idle", 0, "")
+        print(f"[Worker GPU {STATE.gpu_id}] Starting one-shot shell on http://0.0.0.0:{worker_port}")
+        uvicorn.run(app, host="0.0.0.0", port=worker_port, log_level="warning")
+        return
+
+    if child_once and child_stage == "decoder":
+        exit_code = run_child_stage(child_stage, request_json, result_json, status_json, artifact_dir)
+        raise SystemExit(exit_code)
+
     patch_language_model_embedding()
 
     first_backbone = next(iter(BACKBONE_MODELS.values()))
@@ -1098,15 +1626,20 @@ def main() -> None:
     STATE.seed = args.seed
     print(f"[Worker GPU {STATE.gpu_id}] Megatron initialized. seed={args.seed}")
 
+    if child_once:
+        exit_code = run_child_stage(child_stage, request_json, result_json, status_json, artifact_dir)
+        raise SystemExit(exit_code)
+
     try:
-        preload_runtime()
+        if runtime_mode == "keep_loaded":
+            preload_runtime()
     except Exception as exc:
         print(f"[Worker GPU {STATE.gpu_id}] WARNING: preload failed: {exc}")
 
     set_status("idle")
     set_phase("idle", 0, "")
     print(f"[Worker GPU {STATE.gpu_id}] Starting on http://0.0.0.0:{worker_port}")
-    uvicorn.run(app, host="0.0.0.0", port=worker_port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=worker_port, log_level="warning")
 
 
 if __name__ == "__main__":

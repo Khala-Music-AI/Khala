@@ -48,11 +48,11 @@ The core characteristics of Khala include:
 
 - `[2026-05-05]` The arXiv paper is now available: [Khala: Scaling Acoustic Token Language Models Toward High-Fidelity Music Generation](https://arxiv.org/abs/2605.01790)
 - `[2026-05-01]` The codebase, environment documentation, and Dockerfile have been cleaned up for release.
+- `[2026-05-11]` Backend inference launch now supports single-GPU safe startup by default, plus multi-GPU and runtime-mode overrides for deployment compatibility.
 
 ### ⏳ TODOs
 
 - `[Coming Soon]` A full deployment guide for musicians and beginner users.
-- `[Coming Soon]` Multi-node and multi-GPU inference deployment support.
 - `[Coming Soon]` Discord community server.
 
 ### 🖥️ Web UI
@@ -96,7 +96,7 @@ docker pull ghcr.io/davidliujiafeng/khala-env:ngc25.02-node24
 
 docker run --gpus all -it --rm \
   --name khala \
-  -p 7869:7869 \
+  -p 30869:30869 \
   -p 8889:8889 \
   ghcr.io/davidliujiafeng/khala-env:ngc25.02-node24
 ```
@@ -132,6 +132,8 @@ cd /workspace/Khala/backend
 bash run_backend.sh
 ```
 
+The default launcher now starts in a single-GPU safe mode. Advanced users can also select specific GPU ids and switch between `one_shot` and `keep_loaded` runtime modes from the same script; see [backend/README_backend.md](./backend/README_backend.md) for details.
+
 ### 5. Start the frontend
 
 In another terminal, run:
@@ -146,7 +148,7 @@ npm run dev
 
 Default URL:
 
-- [http://127.0.0.1:7869](http://127.0.0.1:7869)
+- [http://127.0.0.1:30869](http://127.0.0.1:30869)
 
 ## 🧠 System Overview
 

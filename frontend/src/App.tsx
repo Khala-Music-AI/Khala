@@ -43,7 +43,7 @@ type TagCategory =
 type TagDef = { label: string; category: TagCategory };
 type TagState = Record<TagCategory, string[]>;
 
-type TrackStatus = "queued" | "generating" | "superres" | "decoding" | "done" | "error" | "finalizing" | "ready";
+type TrackStatus = "queued" | "generating" | "superres" | "decoding" | "done" | "error" | "ready";
 type Track = {
   id: string;
   title: string;
@@ -52,8 +52,17 @@ type Track = {
   seconds: number;
   actualSeconds?: number;
   phaseDisplay?: string;
+  workerPhase?: string;
   jobId?: string;
   trackIndex?: number;
+};
+type PlaybackState = {
+  currentTime: number;
+  duration: number;
+};
+type ProgressMotionMeta = {
+  target: number;
+  smoothingMs: number;
 };
 
 const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
@@ -63,6 +72,10 @@ const formatMmSs = (t: number) =>
 
 function cx(...parts: Array<string | false | undefined | null>) {
   return parts.filter(Boolean).join(" ");
+}
+
+function isLoadingPhase(phaseDisplay?: string, workerPhase?: string) {
+  return Boolean(workerPhase?.startsWith("loading_") || phaseDisplay?.startsWith("Loading "));
 }
 
 /* eslint-disable */
@@ -516,21 +529,58 @@ export default function AiMusicStudio() {
   const [promptMode, setPromptMode] = useState<PromptMode>("natural");
 
   const [prompt, setPrompt] = useState(
-    `Cinematic city-pop with lush chords, warm bass, and nostalgic synth textures. Tempo ~92 BPM, intimate and airy mix.`
+    `A warm, mid-tempo reggae groove driven by a deep, melodic bassline and offbeat guitar skanks, with a steady one-drop drum pattern. The male vocal is smooth and earnest, carrying a message of resilience over the rhythm's gentle sway.`
   );
 
   // Preserve lyrics when switching between vocal and instrumental modes.
   const [lyrics, setLyrics] = useState(`[Verse]
-Neon drips on midnight glass
-I breathe the rain and let it pass
+The drums are beating through the morning light
+Concrete jungles burning but the roots run deep tonight
+They march with voices rising like the tide against the shore
+But inside my chest a steady pulse is keeping score
+
+[Pre-Chorus]
+Let the fire rage outside my door
+I've got a revolution I can't ignore
+The bassline holds me when the world falls apart
 
 [Chorus]
-Hold me where the skyline bends
-We're the echo that never ends`);
+Peace in the rhythm, fire in the street
+One drop of love to keep the heart's own beat
+We're marching but we're swaying to the sound
+Revolution lives where the soul is found
+
+[Verse]
+Sirens wailing down a Babylon road
+Children of the sun carry a heavier load
+But the moon still rises and the ocean don't lie
+Every wave reminds us we were born to get by
+
+[Pre-Chorus]
+Let the powers try to shake the ground
+We've got a frequency that can't be drowned
+One heart, one pulse, one island in the storm
+
+[Chorus]
+Peace in the rhythm, fire in the street
+One drop of love to keep the heart's own beat
+We're marching but we're swaying to the sound
+Revolution lives where the soul is found
+
+[Bridge]
+From the hills to the harbor lights
+We carry torches through the longest nights
+The music never stops, it keeps us whole
+
+[Chorus]
+Peace in the rhythm, fire in the street
+One drop of love to keep the heart's own beat
+We're marching but we're swaying to the sound
+Revolution lives where the soul is found`);
 
   const [durationMin, setDurationMin] = useState(3);
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [topK, setTopK] = useState(50);
+  const [topK, setTopK] = useState(40);
   const [temperature, setTemperature] = useState(1.0);
 
   // Backend currently returns two samples per request.
@@ -660,8 +710,13 @@ We're the echo that never ends`);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [activePreview, setActivePreview] = useState<string | null>(null);
+  const [playbackByTrack, setPlaybackByTrack] = useState<Record<string, PlaybackState>>({});
+  const [displayProgressByTrack, setDisplayProgressByTrack] = useState<Record<string, number>>({});
   const audioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
-  const tickRef = useRef<number | null>(null);
+  const progressMotionRef = useRef<Record<string, ProgressMotionMeta>>({});
+  const displayProgressRef = useRef<Record<string, number>>({});
+  const progressRafRef = useRef<number>(0);
+  const progressLastFrameRef = useRef<number>(0);
 
   const studioMode = tracks.length > 0;
 
@@ -672,20 +727,30 @@ We're the echo that never ends`);
     return Math.max(1, Math.round((base * NUM_SAMPLES * sampling) / parallel));
   }, [durationMin, topK, temperature, NUM_SAMPLES]);
 
-  function stopTick() {
-    if (tickRef.current !== null) {
-      window.clearInterval(tickRef.current);
-      tickRef.current = null;
-    }
-  }
-
   function resetQueue() {
-    stopTick();
     stopPoll();
     setIsGenerating(false);
     setTracks([]);
     setActivePreview(null);
+    setPlaybackByTrack({});
+    setDisplayProgressByTrack({});
+    displayProgressRef.current = {};
+    progressMotionRef.current = {};
+    if (progressRafRef.current) cancelAnimationFrame(progressRafRef.current);
+    progressRafRef.current = 0;
+    progressLastFrameRef.current = 0;
     setCurrentJobId(null);
+  }
+
+  function syncTrackPlayback(trackId: string, el: HTMLAudioElement | null) {
+    if (!el) return;
+    setPlaybackByTrack((prev) => ({
+      ...prev,
+      [trackId]: {
+        currentTime: Number.isFinite(el.currentTime) ? el.currentTime : 0,
+        duration: Number.isFinite(el.duration) ? el.duration : 0,
+      },
+    }));
   }
 
   function stopPoll() {
@@ -698,7 +763,6 @@ We're the echo that never ends`);
   async function startGenerate() {
     if (!effectivePrompt.trim() && promptMode === "natural") return;
     if (promptMode === "tags" && totalSelectedTags === 0) return;
-    stopTick();
     stopPoll();
     setIsGenerating(true);
 
@@ -731,7 +795,7 @@ We're the echo that never ends`);
         status: (resp.status === "queued" ? "queued" : "generating") as TrackStatus,
         progress: 0,
         seconds: secondsTarget,
-        phaseDisplay: resp.status === "queued" ? `排队中 (第${resp.queue_position}位)` : "生成中...",
+        phaseDisplay: resp.status === "queued" ? `Queued (#${resp.queue_position})` : "Generating...",
         jobId,
         trackIndex: i,
       }));
@@ -748,20 +812,22 @@ We're the echo that never ends`);
               const bt = job.tracks?.[i];
               if (!bt) return t;
               const newStatus = bt.status === "done" ? "ready" : bt.status;
-              // Only backbone progress is currently displayed as a percentage.
               const rawProgress = bt.progress ?? t.progress;
+              const queuePosition = job.queue_position as number | undefined;
               const phaseLabel =
-                bt.status === "done" ? "完成" :
-                bt.status === "decoding" ? "音频解码中..." :
-                bt.status === "superres" ? "音质超分中..." :
-                bt.status === "queued" ? "排队中" :
-                `音乐主干生成中 ${Math.round(rawProgress)}%`;
+                bt.phase_display ||
+                (bt.status === "done" ? "Done"
+                  : bt.status === "decoding" ? "Decoding..."
+                  : bt.status === "superres" ? `Super-Resolution Generating · ${Math.round(rawProgress)}%`
+                  : bt.status === "queued" ? (queuePosition ? `Queued · Position #${queuePosition}` : "Queued")
+                  : `Backbone generating · ${Math.round(rawProgress)}%`);
               return {
                 ...t,
                 status: newStatus as TrackStatus,
                 progress: bt.progress ?? t.progress,
                 actualSeconds: bt.duration_sec > 0 ? bt.duration_sec : t.actualSeconds,
                 phaseDisplay: phaseLabel,
+                workerPhase: bt.worker_phase,
               };
             })
           );
@@ -776,7 +842,7 @@ We're the echo that never ends`);
         } catch {
           // Keep polling on transient network errors.
         }
-      }, 2000);
+      }, 800);
     } catch (err: any) {
       alert("Network error: " + (err?.message || err));
       setIsGenerating(false);
@@ -789,7 +855,7 @@ We're the echo that never ends`);
 
   // Auto-grow lyrics input without affecting the controls column height.
   const lyricsRef = useRef<HTMLTextAreaElement | null>(null);
-  const LYRICS_MAX_PX_COMPOSE = 920;
+  const LYRICS_MAX_PX_COMPOSE = 640;
   function autosizeLyricsCompose() {
     const el = lyricsRef.current;
     if (!el) return;
@@ -802,9 +868,16 @@ We're the echo that never ends`);
   useEffect(() => {
     runSelfTests();
     autosizeLyricsCompose();
-    return () => { stopTick(); stopPoll(); };
+    return () => {
+      stopPoll();
+      if (progressRafRef.current) cancelAnimationFrame(progressRafRef.current);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    displayProgressRef.current = displayProgressByTrack;
+  }, [displayProgressByTrack]);
 
   useEffect(() => {
     if (!studioMode) autosizeLyricsCompose();
@@ -817,6 +890,96 @@ We're the echo that never ends`);
       setInputOpen(false);
     }
   }, [studioMode]);
+
+  useEffect(() => {
+    const now = performance.now();
+    const activeIds = new Set(tracks.map((t) => t.id));
+
+    setDisplayProgressByTrack((prev) => {
+      const next: Record<string, number> = {};
+      for (const track of tracks) {
+        next[track.id] = prev[track.id] ?? (isLoadingPhase(track.phaseDisplay, track.workerPhase) ? 0 : track.progress);
+      }
+      displayProgressRef.current = next;
+      return next;
+    });
+
+    for (const track of tracks) {
+      const prevMeta = progressMotionRef.current[track.id];
+      const loadingPhase = isLoadingPhase(track.phaseDisplay, track.workerPhase);
+      const currentDisplay = displayProgressRef.current[track.id] ?? track.progress;
+      if (!prevMeta) {
+        progressMotionRef.current[track.id] = {
+          target: loadingPhase ? 0 : track.progress,
+          smoothingMs: track.status === "ready" || track.status === "done" ? 180 : 1400,
+        };
+        continue;
+      }
+      const nextTarget = loadingPhase ? 0 : track.progress;
+      if (nextTarget !== prevMeta.target) {
+        const deltaToDisplay = track.progress - currentDisplay;
+        const smoothingMs =
+          track.status === "ready" || track.status === "done"
+            ? 180
+            : deltaToDisplay > 12
+              ? 900
+              : deltaToDisplay > 6
+                ? 1100
+                : 1400;
+        progressMotionRef.current[track.id] = {
+          target: nextTarget,
+          smoothingMs,
+        };
+      }
+    }
+
+    for (const trackId of Object.keys(progressMotionRef.current)) {
+      if (!activeIds.has(trackId)) delete progressMotionRef.current[trackId];
+    }
+  }, [tracks]);
+
+  useEffect(() => {
+    const tick = (now: number) => {
+      const prevNow = progressLastFrameRef.current || now;
+      const dt = Math.min((now - prevNow) / 1000, 0.1);
+      progressLastFrameRef.current = now;
+
+      setDisplayProgressByTrack((prev) => {
+        let changed = false;
+        const next = { ...prev };
+
+        for (const [trackId, meta] of Object.entries(progressMotionRef.current)) {
+          if (!meta) continue;
+          const current = next[trackId] ?? 0;
+          const target = meta.target;
+
+          if (current < target) {
+            const alpha = 1 - Math.exp(-(dt * 1000) / meta.smoothingMs);
+            const eased = Math.min(target, current + (target - current) * alpha);
+            if (Math.abs(eased - current) > 0.001) {
+              next[trackId] = eased;
+              changed = true;
+            }
+          } else if (current > target) {
+            next[trackId] = target;
+            changed = true;
+          }
+        }
+
+        if (changed) displayProgressRef.current = next;
+        return changed ? next : prev;
+      });
+
+      progressRafRef.current = requestAnimationFrame(tick);
+    };
+
+    progressRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (progressRafRef.current) cancelAnimationFrame(progressRafRef.current);
+      progressRafRef.current = 0;
+      progressLastFrameRef.current = 0;
+    };
+  }, []);
 
   const DURATION_PRESETS = [2, 3, 4, 5, 8, 10];
 
@@ -1184,7 +1347,7 @@ We're the echo that never ends`);
       layout
       layoutId="panel-prompt"
       transition={panelTransition}
-      className={cx(ui.surface1, ui.insetStroke, "p-5")}
+      className={cx(ui.surface1, ui.insetStroke, "p-5", variant === "studio" && "h-full")}
     >
       <div className="flex items-start justify-between gap-3 pb-4">
         <div>
@@ -1207,22 +1370,24 @@ We're the echo that never ends`);
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 8 }}
               transition={{ duration: 0.18 }}
+              className={cx(variant === "studio" && "h-full flex flex-col")}
             >
               <textarea
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
-                rows={variant === "compose" ? 16 : 8}
+                rows={variant === "compose" ? 16 : 14}
                 placeholder="Describe style, vibe, instruments, tempo, mix…"
                 className={cx(
                   "w-full resize-none rounded-2xl px-4 py-3 text-sm text-white/90 outline-none placeholder:text-white/35",
+                  variant === "studio" && "flex-1",
                   ui.surface3,
                   ui.insetStroke,
                   "focus:ring-1 focus:ring-white/15 focus:border-white/20"
                 )}
+                style={variant === "studio"
+                  ? { maxHeight: "760px", overflowY: "auto" }
+                  : undefined}
               />
-              <div className="mt-2 text-[11px] text-white/50">
-                Tip: 1–3 sentences + constraints (tempo, instruments) works best.
-              </div>
             </motion.div>
           ) : (
             <motion.div
@@ -1414,7 +1579,7 @@ We're the echo that never ends`);
       <div className="flex items-start justify-between gap-3 pb-4">
         <div>
           <div className="text-sm font-semibold tracking-tight">Lyrics</div>
-          <div className="mt-1 text-xs text-white/55">Auto-grow → then scroll</div>
+          <div className="mt-1 text-xs text-white/55">Auto-grow to max height, then scroll</div>
         </div>
         <Pill active>Required</Pill>
       </div>
@@ -1487,25 +1652,35 @@ We're the echo that never ends`);
               <Divider />
             </div>
 
-            <div className="mt-5 space-y-5">
-              {renderPromptPanel("studio")}
+            <div
+              className={cx(
+                "mt-5 grid grid-cols-1 gap-5",
+                mode === "vocal" && "lg:grid-cols-12"
+              )}
+            >
+              <div className={cx(mode === "vocal" && "lg:col-span-7 h-full")}>
+                {renderPromptPanel("studio")}
+              </div>
 
               <AnimatePresence mode="wait" initial={false}>
                 {mode === "vocal" ? (
-                  <motion.div
+                  <motion.section
                     key="studio-lyrics"
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: 10 }}
                     transition={{ duration: 0.2 }}
+                    className={cx(ui.surface1, ui.insetStroke, "h-full p-5 flex flex-col lg:col-span-5")}
                   >
                     <div>
-                      <div className="text-[11px] tracking-[0.18em] uppercase text-white/55">
-                        Lyrics
-                      </div>
-                      <div className="mt-1 text-[11px] text-white/55">
+                      <div className="text-sm font-semibold tracking-tight">Lyrics</div>
+                      <div className="mt-1 text-xs text-white/55">
                         Scrollable view for long lyrics.
                       </div>
+                    </div>
+
+                    <div className="mt-4">
+                      <Divider />
                     </div>
 
                     <textarea
@@ -1514,14 +1689,14 @@ We're the echo that never ends`);
                       rows={14}
                       placeholder="Paste lyrics here…"
                       className={cx(
-                        "mt-2 w-full resize-none rounded-2xl px-4 py-3 text-sm text-white/90 outline-none placeholder:text-white/35",
+                        "mt-4 w-full flex-1 resize-none rounded-2xl px-4 py-3 text-sm text-white/90 outline-none placeholder:text-white/35",
                         ui.surface3,
                         ui.insetStroke,
                         "focus:ring-1 focus:ring-white/15 focus:border-white/20"
                       )}
                       style={{ maxHeight: "760px", overflowY: "auto" }}
                     />
-                  </motion.div>
+                  </motion.section>
                 ) : (
                   <motion.div
                     key="studio-nolyrics"
@@ -1583,17 +1758,19 @@ We're the echo that never ends`);
       </div>
 
       <div className="mt-5 space-y-4">
-        {tracks.map((t) => (
-          <motion.div
-            key={t.id}
-            layout
-            className={cx(
-              ui.surface2,
-              ui.insetStroke,
-              "p-5 transition",
-              "hover:bg-white/[0.10]"
-            )}
-          >
+        {tracks.map((t) => {
+          const loadingPhase = isLoadingPhase(t.phaseDisplay, t.workerPhase);
+          return (
+            <motion.div
+              key={t.id}
+              layout
+              className={cx(
+                ui.surface2,
+                ui.insetStroke,
+                "p-5 transition",
+                "hover:bg-white/[0.10]"
+              )}
+            >
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <div className="flex items-center gap-2">
@@ -1612,7 +1789,6 @@ We're the echo that never ends`);
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
                       {t.phaseDisplay || (t.status === "queued" ? "Queued"
                         : t.status === "superres" ? "Super-res"
-                        : t.status === "finalizing" ? "Finalizing"
                         : "Generating")}
                     </span>
                   )}
@@ -1622,6 +1798,13 @@ We're the echo that never ends`);
                     ? `Duration • ${formatMmSs(t.actualSeconds)}`
                     : `Target • ${formatMmSs(t.seconds)}`}
                 </div>
+                {(t.status === "ready" || t.status === "done") && (
+                  <div className="mt-1 text-xs text-white/45">
+                    {formatMmSs(playbackByTrack[t.id]?.currentTime ?? 0)} / {formatMmSs(
+                      playbackByTrack[t.id]?.duration || t.actualSeconds || t.seconds
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="flex items-center gap-2">
@@ -1660,7 +1843,6 @@ We're the echo that never ends`);
                 {t.jobId != null && t.trackIndex != null ? (
                   <a
                     href={(t.status === "ready" || t.status === "done") ? trackWavUrl(t.jobId, t.trackIndex) : "#"}
-                    download={`sample_${(t.trackIndex ?? 0) + 1}.wav`}
                     onClick={(e) => { if (t.status !== "ready" && t.status !== "done") e.preventDefault(); }}
                     className={cx(
                       ui.btnBase,
@@ -1683,13 +1865,23 @@ We're the echo that never ends`);
 
             <div className="mt-4">
               <div className="h-2 w-full rounded-full bg-white/10">
-                <div
-                  className="h-2 rounded-full bg-white/70"
-                  style={{
-                    width: `${t.progress.toFixed(1)}%`,
-                    opacity: (t.status === "ready" || t.status === "done") ? 0.85 : 0.55,
-                  }}
-                />
+                {loadingPhase ? (
+                  <div className="relative h-2 overflow-hidden rounded-full">
+                    <motion.div
+                      className="absolute inset-y-0 left-0 w-1/3 rounded-full bg-white/65"
+                      animate={{ x: ["-120%", "320%"] }}
+                      transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
+                    />
+                  </div>
+                ) : (
+                  <div
+                    className="h-2 rounded-full bg-white/70 transition-opacity duration-500 ease-out"
+                    style={{
+                      width: `${(displayProgressByTrack[t.id] ?? t.progress).toFixed(1)}%`,
+                      opacity: (t.status === "ready" || t.status === "done") ? 0.85 : 0.55,
+                    }}
+                  />
+                )}
               </div>
               {/* progress text removed — shown in top-left pill only */}
             </div>
@@ -1706,13 +1898,20 @@ We're the echo that never ends`);
                 <audio
                   ref={(el) => { if (el) audioRefs.current.set(t.id, el); else audioRefs.current.delete(t.id); }}
                   src={trackMp3Url(t.jobId, t.trackIndex)}
-                  onEnded={() => setActivePreview(null)}
+                  onLoadedMetadata={(e) => syncTrackPlayback(t.id, e.currentTarget)}
+                  onTimeUpdate={(e) => syncTrackPlayback(t.id, e.currentTarget)}
+                  onSeeked={(e) => syncTrackPlayback(t.id, e.currentTarget)}
+                  onEnded={(e) => {
+                    syncTrackPlayback(t.id, e.currentTarget);
+                    setActivePreview(null);
+                  }}
                   hidden
                 />
               )}
             </div>
-          </motion.div>
-        ))}
+            </motion.div>
+          );
+        })}
       </div>
     </motion.div>
   );
@@ -1735,7 +1934,7 @@ We're the echo that never ends`);
           transition={panelTransition}
           className={cx(
             "col-span-1 min-w-0 md:col-span-12",
-            mode === "vocal" ? "lg:col-span-7 xl:col-span-8" : "lg:col-span-12"
+            mode === "vocal" ? "lg:col-span-6 xl:col-span-7" : "lg:col-span-12"
           )}
         >
           {renderPromptPanel("compose")}
@@ -1747,7 +1946,7 @@ We're the echo that never ends`);
             <motion.div
               layout
               transition={panelTransition}
-              className="col-span-1 min-w-0 md:col-span-12 lg:col-span-4"
+              className="col-span-1 min-w-0 md:col-span-12 lg:col-span-5"
             >
               {LyricsPanelCompose}
             </motion.div>

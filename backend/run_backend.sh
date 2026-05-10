@@ -6,6 +6,8 @@ set -euo pipefail
 #
 # Usage:
 #   bash run_backend.sh
+#   bash run_backend.sh --gpus 0
+#   bash run_backend.sh --gpus 0,1 --runtime-mode keep_loaded
 #   bash run_backend.sh stop
 #
 # This script assumes the runtime environment is already prepared.
@@ -21,12 +23,12 @@ LOG_DIR="$SCRIPT_DIR/logs"
 
 # ============================================================================
 # User-facing configuration
-# Edit GPU_IDS to choose which physical GPUs will run workers.
-# NUM_WORKERS is derived automatically so the worker count stays in sync.
+# Default behavior is single-GPU safe mode.
+# Advanced users can override GPU selection and runtime mode via CLI flags.
 # ============================================================================
 
 GPU_IDS=(0)
-NUM_WORKERS=${#GPU_IDS[@]}
+WORKER_RUNTIME_MODE=one_shot # keep_loaded | one_shot
 
 API_PORT=8889
 WORKER_BASE_PORT=8001
@@ -46,6 +48,56 @@ MEGATRON_ARGS=(
     --flash-decode
     --bf16
 )
+
+NUM_WORKERS=0
+
+
+usage() {
+    cat <<'EOF'
+Usage:
+  bash run_backend.sh
+  bash run_backend.sh --gpus 0
+  bash run_backend.sh --gpus 0,1 --runtime-mode keep_loaded
+  bash run_backend.sh stop
+
+Options:
+  --gpus <ids>            Comma-separated physical GPU ids, e.g. 0 or 0,1 or 6,7
+  --runtime-mode <mode>   Worker runtime mode: one_shot or keep_loaded
+  --help                  Show this help message
+
+Default behavior:
+  --gpus 0
+  --runtime-mode one_shot
+EOF
+}
+
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --gpus)
+                [[ $# -ge 2 ]] || { echo "ERROR: --gpus requires a value."; exit 1; }
+                IFS=',' read -r -a GPU_IDS <<< "$2"
+                shift 2
+                ;;
+            --runtime-mode)
+                [[ $# -ge 2 ]] || { echo "ERROR: --runtime-mode requires a value."; exit 1; }
+                WORKER_RUNTIME_MODE="$2"
+                shift 2
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "ERROR: Unknown argument: $1"
+                echo ""
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
 
 
 stop_services() {
@@ -75,8 +127,27 @@ cleanup_stale_pids() {
 
 
 validate_configuration() {
+    local cleaned_gpu_ids=()
+    for gpu in "${GPU_IDS[@]}"; do
+        gpu="${gpu//[[:space:]]/}"
+        [[ -n "$gpu" ]] || continue
+        [[ "$gpu" =~ ^[0-9]+$ ]] || {
+            echo "ERROR: Invalid GPU id '$gpu'. Use comma-separated integers like --gpus 0,1."
+            exit 1
+        }
+        cleaned_gpu_ids+=("$gpu")
+    done
+
+    GPU_IDS=("${cleaned_gpu_ids[@]}")
+    NUM_WORKERS=${#GPU_IDS[@]}
+
     if [[ "$NUM_WORKERS" -eq 0 ]]; then
         echo "ERROR: GPU_IDS is empty, so no workers would be started."
+        exit 1
+    fi
+
+    if [[ "$WORKER_RUNTIME_MODE" != "one_shot" && "$WORKER_RUNTIME_MODE" != "keep_loaded" ]]; then
+        echo "ERROR: Unsupported runtime mode '$WORKER_RUNTIME_MODE'. Use one_shot or keep_loaded."
         exit 1
     fi
 }
@@ -101,6 +172,7 @@ start_workers() {
         PYTHONUNBUFFERED=1 \
         nohup python backend_worker.py \
             --worker-port "$local_port" \
+            --runtime-mode "$WORKER_RUNTIME_MODE" \
             --seed "$local_seed" \
             "${MEGATRON_ARGS[@]}" \
             > "$local_log_file" 2>&1 &
@@ -163,6 +235,7 @@ start_api() {
 print_summary() {
     echo ""
     echo "============================================"
+    echo "  Runtime mode: $WORKER_RUNTIME_MODE"
     echo "  Workers:  $NUM_WORKERS"
     echo "  GPUs:     ${GPU_IDS[*]}"
     echo "  Worker ports: $WORKER_BASE_PORT-$((WORKER_BASE_PORT + NUM_WORKERS - 1))"
@@ -187,6 +260,7 @@ main() {
     cd "$SCRIPT_DIR"
     export PYTHONPATH="$PROJECT_ROOT:$MEGATRON_ROOT:$DECODER_ROOT:${PYTHONPATH:-}"
 
+    parse_args "$@"
     validate_configuration
     cleanup_stale_pids
     start_workers
@@ -202,4 +276,4 @@ if [[ "${1:-}" == "stop" ]]; then
     exit 0
 fi
 
-main
+main "$@"

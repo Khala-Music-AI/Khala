@@ -6,8 +6,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     host: "0.0.0.0",
-    port: 7869,
-    allowedHosts: ["www.gunterdong.top", "gunterdong.top"],
+    port: 30869,
     hmr: false,
     proxy: {
       "/api": {

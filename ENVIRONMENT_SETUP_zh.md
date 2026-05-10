@@ -173,7 +173,7 @@ npm run dev
 
 默认情况下：
 
-- 前端开发服务器监听 `7869`
+- 前端开发服务器监听 `30869`
 - 后端 API 监听 `8889`
 
 ## 9. Docker 高级启动示例
@@ -185,7 +185,7 @@ docker run -d \
   --name khala_dev \
   --gpus all \
   -p 2222:22 \
-  -p 7869:7869 \
+  -p 30869:30869 \
   -p 8889:8889 \
   -v /path/to/your/workspace:/workspace \
   <your-image> \

@@ -32,6 +32,6 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir \
 
 WORKDIR /workspace
 
-EXPOSE 22 7869 8889
+EXPOSE 22 30869 8889
 
 CMD ["/bin/bash"]

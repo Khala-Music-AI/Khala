@@ -173,7 +173,7 @@ npm run dev
 
 By default:
 
-- the frontend development server listens on `7869`
+- the frontend development server listens on `30869`
 - the backend API listens on `8889`
 
 ## 9. Advanced Docker Run Example
@@ -185,7 +185,7 @@ docker run -d \
   --name khala_dev \
   --gpus all \
   -p 2222:22 \
-  -p 7869:7869 \
+  -p 30869:30869 \
   -p 8889:8889 \
   -v /path/to/your/workspace:/workspace \
   <your-image> \

@@ -37,16 +37,17 @@
 
 它负责：
 
-- 定义用户可修改的启动配置
+- 提供默认的单卡安全启动模式
+- 接收高级用户通过 CLI 传入的 GPU 与运行模式覆盖参数
 - 按 `GPU_IDS` 启动一个或多个 worker
 - 等待 worker 健康检查通过
 - 启动 API 调度层
 - 在前台 tail 日志
 
-最重要的配置都在文件顶部：
+最重要的启动控制项包括：
 
-- `GPU_IDS`：指定哪些物理 GPU 用来跑 worker
-- `NUM_WORKERS`：由 `GPU_IDS` 自动推导
+- `--gpus`：指定哪些物理 GPU 用来跑 worker
+- `--runtime-mode`：`one_shot` 或 `keep_loaded`
 - `API_PORT`
 - `WORKER_BASE_PORT`
 - `BASE_MASTER_PORT`
@@ -101,6 +102,20 @@ cd backend
 bash run_backend.sh
 ```
 
+默认行为：
+
+- 使用 GPU `0`
+- 启动 1 个 worker
+- 运行在 `one_shot` 模式
+
+常见高级示例：
+
+```bash
+bash run_backend.sh --gpus 0
+bash run_backend.sh --gpus 0,1
+bash run_backend.sh --gpus 0,1 --runtime-mode keep_loaded
+```
+
 停止所有后端进程：
 
 ```bash
@@ -141,21 +156,29 @@ tail -f backend/logs/worker_0.log
 
 ### 修改使用的 GPU 数量
 
-编辑 [run_backend.sh](./run_backend.sh) 顶部的 `GPU_IDS`：
+通过 `run_backend.sh` 传入 `--gpus`：
 
 ```bash
-GPU_IDS=(0)
+bash run_backend.sh --gpus 0
+bash run_backend.sh --gpus 0,1
+bash run_backend.sh --gpus 6,7
 ```
 
-例如：
+每个 GPU id 会启动一个 worker，worker 数量会根据你传入的 id 个数自动推导。
+
+### 修改运行模式
+
+通过 `run_backend.sh` 传入 `--runtime-mode`：
 
 ```bash
-GPU_IDS=(0)
-GPU_IDS=(0 1)
-GPU_IDS=(2 3)
+bash run_backend.sh --runtime-mode one_shot
+bash run_backend.sh --runtime-mode keep_loaded
 ```
 
-`NUM_WORKERS` 会根据 `GPU_IDS` 的长度自动推导。
+建议：
+
+- `one_shot`：更适合作为单卡或显存更紧张环境下的安全默认模式
+- `keep_loaded`：更适合高显存 GPU 和重复推理场景
 
 ### 修改端口
 

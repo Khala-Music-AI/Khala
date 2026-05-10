@@ -48,11 +48,11 @@ Khala 的核心特点包括：
 
 - `[2026-05-05]` arXiv 论文已上线：[Khala: Scaling Acoustic Token Language Models Toward High-Fidelity Music Generation](https://arxiv.org/abs/2605.01790)
 - `[2026-05-01]` 代码、环境配置文档与 Dockerfile 已整理完成。
+- `[2026-05-11]` 已支持默认单卡安全启动，并兼容通过同一后端脚本覆盖多卡与不同运行模式的部署推理配置。
 
 ### ⏳ TODOs
 
 - `[Coming Soon]` 对音乐人及小白友好的完整部署教程
-- `[Coming Soon]` 多机多卡部署推理兼容性
 - `[Coming Soon]` Discord 交流群
 
 ### 🖥️ 前端界面
@@ -96,7 +96,7 @@ docker pull ghcr.io/davidliujiafeng/khala-env:ngc25.02-node24
 
 docker run --gpus all -it --rm \
   --name khala \
-  -p 7869:7869 \
+  -p 30869:30869 \
   -p 8889:8889 \
   ghcr.io/davidliujiafeng/khala-env:ngc25.02-node24
 ```
@@ -132,6 +132,8 @@ cd /workspace/Khala/backend
 bash run_backend.sh
 ```
 
+现在默认启动方式就是单卡安全模式。高级用户也可以通过同一个脚本指定 GPU 编号，并切换 `one_shot` / `keep_loaded` 运行模式；具体用法见 [backend/README_backend_zh.md](./backend/README_backend_zh.md)。
+
 ### 5. 启动前端
 
 在另一个终端中执行：
@@ -146,7 +148,7 @@ npm run dev
 
 默认访问地址：
 
-- [http://127.0.0.1:7869](http://127.0.0.1:7869)
+- [http://127.0.0.1:30869](http://127.0.0.1:30869)
 
 ## 🧠 系统结构
 

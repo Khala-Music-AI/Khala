@@ -25,7 +25,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-SUPERRES_TEXT_MODE = "same_as_backbone"
+# ============================================================
+'''
+same_as_backbone
+same_as_backbone_no_description
+'''
+SUPERRES_TEXT_MODE = "same_as_backbone_no_description"
 
 # ============================================================
 # CLI
@@ -38,7 +43,7 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--worker-base-port", type=int, default=8001)
     p.add_argument("--worker-host", type=str, default="127.0.0.1")
-    p.add_argument("--health-interval", type=float, default=5.0)
+    p.add_argument("--health-interval", type=float, default=1.0)
     return p.parse_args()
 
 
@@ -160,9 +165,12 @@ class TrackResult:
     def __init__(self):
         self.status = "queued"       # queued / generating / superres / decoding / done / error
         self.worker_id: int = -1
+        self.worker_phase: str = "idle"
         self.phase_start_time: float = 0.0
         self.mp3_bytes: Optional[bytes] = None
         self.wav_bytes: Optional[bytes] = None
+        self.mp3_filename: Optional[str] = None
+        self.wav_filename: Optional[str] = None
         self.duration_sec: float = 0
         self.error: Optional[str] = None
         self.result: Optional[dict] = None
@@ -216,6 +224,7 @@ def _track_to_dict(index: int, t: TrackResult) -> dict:
         "progress": progress,
         "phase_display": phase_display,
         "worker_id": t.worker_id,
+        "worker_phase": t.worker_phase,
         "duration_sec": t.duration_sec,
         "error": t.error,
     }
@@ -245,18 +254,33 @@ def _estimate_progress(track: TrackResult) -> int:
 def _phase_display(track: TrackResult, progress: int) -> str:
     """Human-readable phase label exposed to the frontend."""
     if track.status == "queued":
-        return "排队中"
+        return "Queued"
     _, detail = _get_worker_progress(track.worker_id)
+    if track.worker_phase == "loading_backbone":
+        return "Loading backbone model..."
+    if track.worker_phase == "loading_superres":
+        return "Loading super-resolution model..."
+    if track.worker_phase == "loading_decoder":
+        return "Loading decoder model..."
     if track.status == "generating":
-        return f"生成 {progress}%" + (f" ({detail})" if detail else "")
+        token_match = re.match(r"^\s*(\d+)\s*/\s*\d+\s+tokens\s*$", detail or "")
+        if token_match:
+            generated_tokens = int(token_match.group(1))
+            elapsed = max(time.time() - track.phase_start_time, 1e-6)
+            tokens_per_second = max(1, int(round(generated_tokens / elapsed)))
+            return (
+                f"Backbone generating · {progress}% · "
+                f"{tokens_per_second} tok/s · {generated_tokens} tokens"
+            )
+        return f"Backbone generating · {progress}%"
     elif track.status == "superres":
-        return f"超分 {progress}%" + (f" ({detail})" if detail else "")
+        return f"Super-Resolution Generating · {progress}%"
     elif track.status == "decoding":
-        return f"解码中" + (f" ({detail})" if detail else "")
+        return "Decoding audio..."
     elif track.status == "done":
-        return "完成"
+        return "Done"
     elif track.status == "error":
-        return "错误"
+        return "Error"
     return ""
 
 
@@ -309,16 +333,21 @@ def _sync_track_phases():
                 w = worker_by_id.get(track.worker_id)
                 if not w:
                     continue
+                if w.phase != track.worker_phase:
+                    track.worker_phase = w.phase
+                    track.phase_start_time = time.time()
                 new_status = _worker_phase_to_track_status(w.phase)
                 if new_status and new_status != track.status:
                     track.status = new_status
-                    track.phase_start_time = time.time()
 
 
 def _worker_phase_to_track_status(phase: str) -> Optional[str]:
     mapping = {
+        "loading_backbone": "generating",
         "backbone": "generating",
+        "loading_superres": "superres",
         "superres": "superres",
+        "loading_decoder": "decoding",
         "decoding": "decoding",
     }
     return mapping.get(phase)
@@ -411,6 +440,7 @@ async def _dispatch_job(job: Job, workers: List[WorkerInfo]):
                 workers[i],
                 track,
                 job.params,
+                seed_offset=batch_start + i,
                 release_worker=is_last_batch,
             )
             for i, track in enumerate(batch_tracks)
@@ -423,6 +453,7 @@ async def _dispatch_to_worker(
     track: TrackResult,
     params: dict,
     timeout: float = 600.0,
+    seed_offset: int = 0,
     release_worker: bool = True,
 ):
     """Send generation request to a single worker and collect results."""
@@ -431,8 +462,10 @@ async def _dispatch_to_worker(
     track.phase_start_time = time.time()
 
     try:
+        request_params = dict(params)
+        request_params["seed_override"] = int(worker.seed) + int(seed_offset)
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
-            r = await client.post(f"{worker.url}/generate", json=params)
+            r = await client.post(f"{worker.url}/generate", json=request_params)
             result = r.json()
 
             if result.get("status") == "ok":
@@ -444,8 +477,10 @@ async def _dispatch_to_worker(
                 mp3_fn = result.get("mp3_filename")
                 wav_fn = result.get("wav_filename")
                 if mp3_fn:
+                    track.mp3_filename = mp3_fn
                     track.mp3_bytes = await _download_worker_file(client, worker, mp3_fn)
                 if wav_fn:
+                    track.wav_filename = wav_fn
                     track.wav_bytes = await _download_worker_file(client, worker, wav_fn)
             else:
                 track.status = "error"
@@ -724,7 +759,7 @@ def get_track_mp3(job_id: str, track_idx: int):
         headers={
             "Content-Length": str(len(track.mp3_bytes)),
             "Accept-Ranges": "bytes",
-            "Content-Disposition": f"inline; filename=track_{track_idx}.mp3",
+            "Content-Disposition": f'inline; filename="{track.mp3_filename or f"track_{track_idx}.mp3"}"',
         },
     )
 
@@ -746,7 +781,7 @@ def get_track_wav(job_id: str, track_idx: int):
         headers={
             "Content-Length": str(len(track.wav_bytes)),
             "Accept-Ranges": "bytes",
-            "Content-Disposition": f"attachment; filename=track_{track_idx}.wav",
+            "Content-Disposition": f'attachment; filename="{track.wav_filename or f"track_{track_idx}.wav"}"',
         },
     )
 
@@ -779,7 +814,7 @@ def main():
         asyncio.create_task(_queue_processor_loop())
 
     print(f"[API] Starting on http://0.0.0.0:{args.port}")
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":
