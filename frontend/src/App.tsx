@@ -78,6 +78,14 @@ function isLoadingPhase(phaseDisplay?: string, workerPhase?: string) {
   return Boolean(workerPhase?.startsWith("loading_") || phaseDisplay?.startsWith("Loading "));
 }
 
+function getVisibleProgress(rawProgress: number, animatedProgress?: number) {
+  const raw = clamp(rawProgress, 0, 100);
+  if (animatedProgress == null || !Number.isFinite(animatedProgress)) return raw;
+  if (raw > 0 && animatedProgress < 0.5) return raw;
+  if (raw - animatedProgress > 45) return raw;
+  return clamp(animatedProgress, 0, 100);
+}
+
 /* eslint-disable */
 /** API helpers */
 const API_BASE = "/api";
@@ -765,6 +773,10 @@ Revolution lives where the soul is found`);
     if (promptMode === "tags" && totalSelectedTags === 0) return;
     stopPoll();
     setIsGenerating(true);
+    setDisplayProgressByTrack({});
+    displayProgressRef.current = {};
+    progressMotionRef.current = {};
+    progressLastFrameRef.current = 0;
 
     const secondsTarget = durationMin * 60;
 
@@ -1760,6 +1772,7 @@ Revolution lives where the soul is found`);
       <div className="mt-5 space-y-4">
         {tracks.map((t) => {
           const loadingPhase = isLoadingPhase(t.phaseDisplay, t.workerPhase);
+          const visibleProgress = getVisibleProgress(t.progress, displayProgressByTrack[t.id]);
           return (
             <motion.div
               key={t.id}
@@ -1877,7 +1890,7 @@ Revolution lives where the soul is found`);
                   <div
                     className="h-2 rounded-full bg-white/70 transition-opacity duration-500 ease-out"
                     style={{
-                      width: `${(displayProgressByTrack[t.id] ?? t.progress).toFixed(1)}%`,
+                      width: `${visibleProgress.toFixed(1)}%`,
                       opacity: (t.status === "ready" || t.status === "done") ? 0.85 : 0.55,
                     }}
                   />

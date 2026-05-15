@@ -29,6 +29,3 @@ checkpoints/
 
 # OS / misc
 *.pid
-
-# Local-only experiments
-song_generate_test.py
